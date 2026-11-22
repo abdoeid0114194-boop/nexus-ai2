@@ -1,0 +1,12 @@
+
+
+# NEXUS uploader safety
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+node_modules/

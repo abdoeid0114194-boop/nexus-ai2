@@ -1,0 +1,184 @@
+
+import os
+import re
+import torch
+from abc import ABC, abstractmethod
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig
+)
+
+class ModelProvider(ABC):
+    @abstractmethod
+    def load(self):
+        pass
+
+    @abstractmethod
+    def generate(self, messages, max_new_tokens,
+                 temperature=0.3, repetition_penalty=1.1,
+                 sample=True):
+        pass
+
+
+class HuggingFaceProvider(ModelProvider):
+
+    def __init__(self, model_path):
+        self.model_path = model_path
+        self.tokenizer = None
+        self.model = None
+        self.bad_ids = []
+
+    def load(self):
+        if not torch.cuda.is_available():
+            raise RuntimeError("NEXUS requires a CUDA GPU.")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_path
+        )
+
+        quantization = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4"
+        )
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            quantization_config=quantization,
+            device_map="auto"
+        )
+
+        cjk = re.compile(
+            r'[\u3040-\u30ff\u3400-\u4dbf'
+            r'\u4e00-\u9fff\uac00-\ud7af]'
+        )
+
+        self.bad_ids = [
+            [i] for token, i in self.tokenizer.get_vocab().items()
+            if cjk.search(
+                self.tokenizer.convert_tokens_to_string([token])
+            )
+        ]
+
+        print(f"Loaded model: {self.model_path}")
+        return self
+
+    def generate(self, messages, max_new_tokens,
+                 temperature=0.3, repetition_penalty=1.1,
+                 sample=True):
+
+        if self.model is None:
+            raise RuntimeError("Model is not loaded.")
+
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt"
+        ).to(self.model.device)
+
+        kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": sample
+        }
+
+        if sample:
+            kwargs.update(
+                temperature=temperature,
+                bad_words_ids=self.bad_ids,
+                repetition_penalty=repetition_penalty
+            )
+
+        with torch.inference_mode():
+            output = self.model.generate(
+                **inputs,
+                **kwargs
+            )
+
+        return self.tokenizer.decode(
+            output[0][inputs.input_ids.shape[1]:],
+            skip_special_tokens=True
+        )
+
+
+class QwenProvider(HuggingFaceProvider):
+    def __init__(self):
+        super().__init__(
+            os.getenv(
+                "NEXUS_QWEN_MODEL",
+                "Qwen/Qwen2.5-7B-Instruct"
+            )
+        )
+
+
+class NexusLMProvider(HuggingFaceProvider):
+    def __init__(self):
+        path = os.getenv("NEXUSLM_MODEL_PATH")
+
+        if not path:
+            raise ValueError(
+                "Set NEXUSLM_MODEL_PATH to your trained model directory."
+            )
+
+        if not os.path.isdir(path):
+            raise FileNotFoundError(
+                f"NexusLM model directory not found: {path}"
+            )
+
+        super().__init__(path)
+
+
+class ModelRouter:
+
+    PROVIDERS = {
+        "qwen": QwenProvider,
+        "nexuslm": NexusLMProvider
+    }
+
+    def __init__(self, provider_name="qwen"):
+        self.provider_name = provider_name.lower()
+        self.provider = None
+
+    def load(self):
+        if self.provider_name not in self.PROVIDERS:
+            raise ValueError(
+                f"Unknown provider: {self.provider_name}"
+            )
+
+        self.provider = self.PROVIDERS[self.provider_name]().load()
+        return self
+
+    def generate(self, *args, **kwargs):
+        if self.provider is None:
+            raise RuntimeError("No active model provider.")
+
+        return self.provider.generate(*args, **kwargs)
+
+    def switch(self, provider_name):
+        name = provider_name.lower()
+
+        if name not in self.PROVIDERS:
+            raise ValueError(f"Unknown provider: {name}")
+
+        if self.provider is not None:
+            del self.provider
+
+        self.provider_name = name
+        self.provider = None
+        torch.cuda.empty_cache()
+
+        return self.load()
+
+
+def create_engine(provider_name=None):
+    provider_name = (
+        provider_name
+        or os.getenv("NEXUS_MODEL_PROVIDER", "qwen")
+    )
+
+    return ModelRouter(provider_name).load()
